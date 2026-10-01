@@ -1,0 +1,465 @@
+import userModel from '../models/user.model.js';
+import invitationModel from '../models/invitation.model.js';
+import projectModel from '../models/project.model.js';
+import * as userService from '../services/user.service.js';
+import { validationResult } from 'express-validator';
+import redisClient from '../services/redis.service.js';
+
+export const createUserController = async (req, res) => {
+    const errors = validationResult(req);
+
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+        const user = await userService.createUser(req.body);
+        const token = await user.generateJWT();
+        delete user._doc.password;
+        res.status(201).json({ user, token });
+    } catch (error) {
+        res.status(400).send(error.message);
+    }
+}
+
+export const loginController = async (req, res) => {
+    const errors = validationResult(req);
+
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+        const { email, password } = req.body;
+        const user = await userModel.findOne({ email }).select('+password');
+
+        if (!user) {
+            return res.status(401).json({
+                errors: [ { msg: 'Invalid Email or Password' } ]
+            });
+        }
+
+        const isMatch = await user.isValidPassword(password);
+
+        if (!isMatch) {
+            return res.status(401).json({
+                errors: [ { msg: 'Invalid Email or Password' } ]
+            });
+        }
+
+        const token = await user.generateJWT();
+        delete user._doc.password;
+        res.status(200).json({ user, token });
+    } catch (error) {
+        console.log(error);
+        res.status(400).send(error.message);
+    }
+}
+
+export const profileController = async (req, res) => {
+    res.status(200).json({
+        user: req.user
+    });
+}
+
+export const logoutController = async (req, res) => {
+    const token = req.cookies?.token || req.headers.authorization?.split(' ')[ 1 ];
+    if (token) {
+        try {
+            await redisClient.set(token, 'logout', 'EX', 60 * 60 * 24);
+        } catch (error) {
+            console.warn('Could not blacklist logout token because Redis is unavailable:', error.message);
+        }
+    }
+
+    res.status(200).json({
+        message: 'Logged out successfully'
+    });
+}
+
+export const getAllUsersController = async (req, res) => {
+    try {
+        const loggedInUser = await userModel.findOne({
+            email: req.user.email
+        });
+        const allUsers = await userService.getAllUsers({ userId: loggedInUser._id });
+        return res.status(200).json({
+            users: allUsers
+        });
+    } catch (error) {
+        console.log(error);
+        res.status(400).send(error.message);
+    }
+}
+
+// Search for users by username or email
+export const searchUserController = async (req, res) => {
+    try {
+        const { query } = req.query;
+        if (!query) {
+            return res.status(400).json({ error: 'Search query is required' });
+        }
+        
+        // Get the logged-in user to exclude from results
+        const loggedInUser = await userModel.findOne({ email: req.user.email });
+        
+        const users = await userModel.find({
+            $and: [
+                {
+                    $or: [
+                        { username: { $regex: query, $options: 'i' } },
+                        { email: { $regex: query, $options: 'i' } }
+                    ]
+                },
+                // Exclude the currently logged-in user
+                { _id: { $ne: loggedInUser._id } }
+            ]
+        }).select('-password').limit(10);
+        
+        res.status(200).json({ users });
+    } catch (error) {
+        console.log(error);
+        res.status(500).send(error.message);
+    }
+}
+
+// Update username
+export const updateUsernameController = async (req, res) => {
+    try {
+        const { username } = req.body;
+        if (!username || username.length < 3) {
+            return res.status(400).json({ error: 'Username must be at least 3 characters long' });
+        }
+        
+        const user = await userModel.findOneAndUpdate(
+            { email: req.user.email },
+            { username },
+            { new: true }
+        ).select('-password');
+        
+        res.status(200).json({ user, message: 'Username updated successfully' });
+    } catch (error) {
+        console.log(error);
+        res.status(500).send(error.message);
+    }
+}
+
+// Send invitation to join a project
+export const sendInvitationController = async (req, res) => {
+    try {
+        const { recipientId, projectId } = req.body;
+        
+        if (!recipientId || !projectId) {
+            return res.status(400).json({ error: 'recipientId and projectId are required' });
+        }
+        
+        // Find the sender user
+        const senderUser = await userModel.findOne({ email: req.user.email });
+        
+        // Check if trying to invite self
+        if (senderUser._id.toString() === recipientId.toString()) {
+            return res.status(400).json({ error: 'You cannot send an invitation to yourself' });
+        }
+        
+        // Check if recipient exists
+        const recipientUser = await userModel.findById(recipientId);
+        if (!recipientUser) {
+            return res.status(404).json({ error: 'Recipient not found' });
+        }
+        
+        // Check if invitation already exists
+        const existingInvitation = await invitationModel.findOne({
+            sender: senderUser._id,
+            recipient: recipientId,
+            project: projectId,
+            status: 'pending'
+        });
+        
+        if (existingInvitation) {
+            return res.status(400).json({ error: 'Invitation already sent' });
+        }
+        
+        // Create new invitation
+        const invitation = await invitationModel.create({
+            sender: senderUser._id,
+            recipient: recipientId,
+            project: projectId
+        });
+        
+        // Populate the invitation before sending back
+        const populatedInvitation = await invitationModel.findById(invitation._id)
+            .populate('sender', 'username email')
+            .populate('recipient', 'username email')
+            .populate('project', 'name');
+        
+        res.status(200).json({ 
+            message: 'Invitation sent successfully',
+            invitation: populatedInvitation
+        });
+    } catch (error) {
+        console.log(error);
+        res.status(500).send(error.message);
+    }
+}
+
+// Get all pending invitations for the logged-in user
+export const getInvitationsController = async (req, res) => {
+    try {
+        const user = await userModel.findOne({ email: req.user.email });
+        
+        const invitations = await invitationModel.find({
+            recipient: user._id,
+            status: 'pending'
+        })
+        .populate('sender', 'username email')
+        .populate('project', 'name')
+        .sort({ createdAt: -1 });
+        
+        res.status(200).json({ invitations });
+    } catch (error) {
+        console.log(error);
+        res.status(500).send(error.message);
+    }
+}
+
+// Accept or reject an invitation
+export const acceptInvitationController = async (req, res) => {
+    try {
+        const { invitationId, action } = req.body;
+        
+        if (!invitationId || !action) {
+            return res.status(400).json({ error: 'invitationId and action are required' });
+        }
+        
+        if (!['accept', 'reject', 'accepted', 'rejected'].includes(action)) {
+            return res.status(400).json({ error: 'Action must be accept/accepted or reject/rejected' });
+        }
+        
+        const invitation = await invitationModel.findById(invitationId);
+        
+        if (!invitation) {
+            return res.status(404).json({ error: 'Invitation not found' });
+        }
+        
+        const user = await userModel.findOne({ email: req.user.email });
+        if (!user) {
+            return res.status(401).json({ error: 'Unauthorized User' });
+        }
+        
+        // Verify the invitation is for the logged-in user
+        if (invitation.recipient.toString() !== user._id.toString()) {
+            return res.status(403).json({ error: 'Unauthorized' });
+        }
+
+        // Normalize action (accept/accepted -> accepted, reject/rejected -> rejected)
+        const normalizedAction = action === 'accept' || action === 'accepted' ? 'accepted' : 'rejected';
+
+        const addUserToProject = async () => {
+            const project = await projectModel.findByIdAndUpdate(
+                invitation.project,
+                { $addToSet: { users: user._id } },
+                { new: true }
+            );
+            return project;
+        };
+
+        if (invitation.status === normalizedAction) {
+            if (normalizedAction === 'accepted' && !await addUserToProject()) {
+                return res.status(404).json({ error: 'Project not found' });
+            }
+            return res.status(200).json({
+                message: `Invitation ${normalizedAction} successfully`,
+                invitation
+            });
+        }
+
+        if (invitation.status !== 'pending') {
+            return res.status(409).json({ error: `Invitation was already ${invitation.status}` });
+        }
+
+        if (normalizedAction === 'accepted' && !await projectModel.exists({ _id: invitation.project })) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        const updatedInvitation = await invitationModel.findOneAndUpdate(
+            { _id: invitation._id, recipient: user._id, status: 'pending' },
+            { $set: { status: normalizedAction } },
+            { new: true }
+        );
+
+        if (!updatedInvitation) {
+            const latestInvitation = await invitationModel.findById(invitation._id);
+            if (latestInvitation?.status !== normalizedAction) {
+                return res.status(409).json({ error: 'Invitation was processed by another request' });
+            }
+            if (normalizedAction === 'accepted' && !await addUserToProject()) {
+                return res.status(404).json({ error: 'Project not found' });
+            }
+            return res.status(200).json({
+                message: `Invitation ${normalizedAction} successfully`,
+                invitation: latestInvitation
+            });
+        }
+
+        if (normalizedAction === 'accepted' && !await addUserToProject()) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+        
+        res.status(200).json({ 
+            message: `Invitation ${normalizedAction} successfully`,
+            invitation: updatedInvitation
+        });
+    } catch (error) {
+        console.log(error);
+        res.status(500).send(error.message);
+    }
+}
+// Upload profile image
+export const uploadProfileImageController = async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+        
+        const imageUrl = `/uploads/${req.file.filename}`;
+        
+        const user = await userModel.findOneAndUpdate(
+            { email: req.user.email },
+            { profileImage: imageUrl },
+            { new: true }
+        ).select('-password');
+        
+        res.status(200).json({ user, message: 'File uploaded successfully' });
+    } catch(err) {
+        console.log(err);
+        res.status(500).json({ error: err.message });
+    }
+}
+
+// Change Password
+export const changePasswordController = async (req, res) => {
+    try {
+        const { currentPassword, newPassword } = req.body;
+        
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({ error: 'Current and new password are required' });
+        }
+        
+        if (newPassword.length < 3) {
+            return res.status(400).json({ error: 'New password must be at least 3 characters long' });
+        }
+        
+        const user = await userModel.findOne({ email: req.user.email }).select('+password');
+        
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        const isMatch = await user.isValidPassword(currentPassword);
+        
+        if (!isMatch) {
+            return res.status(400).json({ error: 'Incorrect current password' });
+        }
+        
+        const hashedPassword = await userModel.hashPassword(newPassword);
+        user.password = hashedPassword;
+        await user.save();
+        
+        res.status(200).json({ message: 'Password changed successfully' });
+    } catch (error) {
+        console.log(error);
+        res.status(500).json({ error: error.message });
+    }
+}
+
+// Delete User Account
+export const deleteUserController = async (req, res) => {
+    try {
+        const { password, reason } = req.body;
+
+        if (!password) {
+            return res.status(400).json({ error: 'Password is required to delete account' });
+        }
+
+        const user = await userModel.findOne({ email: req.user.email }).select('+password');
+        
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const isMatch = await user.isValidPassword(password);
+        if (!isMatch) {
+            return res.status(401).json({ error: 'Incorrect password' });
+        }
+
+        await userModel.deleteOne({ email: req.user.email });
+        
+        // Optionally store the Feedback/Reason in a separate log collection
+        if (reason) {
+            console.log(`User ${req.user.email} deleted account. Reason: ${reason}`);
+        }
+        
+        res.status(200).json({ message: 'Account deleted successfully' });
+    } catch (error) {
+        console.log(error);
+        res.status(500).json({ error: error.message });
+    }
+}
+
+// Update Theme
+export const updateThemeController = async (req, res) => {
+    try {
+        const { theme, type } = req.body;
+        
+        let updateField = {};
+        if (type === 'app') {
+            updateField = { appTheme: theme };
+        } else {
+            updateField = { editorTheme: theme };
+        }
+        
+        const user = await userModel.findOneAndUpdate(
+            { email: req.user.email },
+            updateField,
+            { new: true }
+        );
+        
+        res.status(200).json({ user, message: 'Theme updated successfully' });
+    } catch (error) {
+        console.log(error);
+        res.status(500).json({ error: error.message });
+    }
+}
+
+// Save AI Configs
+export const updateAiConfigsController = async (req, res) => {
+    try {
+        const { aiConfigs } = req.body;
+        
+        if (!Array.isArray(aiConfigs)) {
+            return res.status(400).json({ error: 'aiConfigs must be an array' });
+        }
+        
+        const user = await userModel.findOneAndUpdate(
+            { email: req.user.email },
+            { aiConfigs },
+            { new: true }
+        ).select('-password');
+        
+        res.status(200).json({ aiConfigs: user.aiConfigs, message: 'AI configs saved successfully' });
+    } catch (error) {
+        console.log(error);
+        res.status(500).json({ error: error.message });
+    }
+}
+
+// Get AI Configs
+export const getAiConfigsController = async (req, res) => {
+    try {
+        const user = await userModel.findOne({ email: req.user.email }).select('aiConfigs');
+        res.status(200).json({ aiConfigs: user?.aiConfigs || [] });
+    } catch (error) {
+        console.log(error);
+        res.status(500).json({ error: error.message });
+    }
+}
